@@ -1,0 +1,445 @@
+name: Org CI + Security (Required)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: required-ci-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect project
+    runs-on: ubuntu-latest
+    outputs:
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_go: ${{ steps.detect.outputs.has_go }}
+      has_java_maven: ${{ steps.detect.outputs.has_java_maven }}
+      has_java_gradle: ${{ steps.detect.outputs.has_java_gradle }}
+      has_rust: ${{ steps.detect.outputs.has_rust }}
+      has_dotnet: ${{ steps.detect.outputs.has_dotnet }}
+      has_ruby: ${{ steps.detect.outputs.has_ruby }}
+      codeql_languages_json: ${{ steps.detect.outputs.codeql_languages_json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          has_files() { git ls-files -z | tr '\0' '\n' | grep -E -q "$1"; }
+          has_node=false
+          has_python=false
+          has_go=false
+          has_java_maven=false
+          has_java_gradle=false
+          has_rust=false
+          has_dotnet=false
+          has_ruby=false
+
+          if has_files '(^|/)(package\.json|pnpm-lock\.yaml|yarn\.lock)$'; then has_node=true; fi
+          if has_files '(^|/)(requirements(\.txt)?|Pipfile|poetry\.lock|pyproject\.toml)$|\.py$'; then has_python=true; fi
+          if has_files '(^|/)go\.mod$|\.go$'; then has_go=true; fi
+          if has_files '(^|/)pom\.xml$'; then has_java_maven=true; fi
+          if has_files '(^|/)build\.gradle(\.kts)?$'; then has_java_gradle=true; fi
+          if has_files '(^|/)Cargo\.toml$'; then has_rust=true; fi
+          if has_files '(\.sln$|\.csproj$)'; then has_dotnet=true; fi
+          if has_files '(^|/)Gemfile$|\.rb$'; then has_ruby=true; fi
+
+          echo "has_node=$has_node" >> "$GITHUB_OUTPUT"
+          echo "has_python=$has_python" >> "$GITHUB_OUTPUT"
+          echo "has_go=$has_go" >> "$GITHUB_OUTPUT"
+          echo "has_java_maven=$has_java_maven" >> "$GITHUB_OUTPUT"
+          echo "has_java_gradle=$has_java_gradle" >> "$GITHUB_OUTPUT"
+          echo "has_rust=$has_rust" >> "$GITHUB_OUTPUT"
+          echo "has_dotnet=$has_dotnet" >> "$GITHUB_OUTPUT"
+          echo "has_ruby=$has_ruby" >> "$GITHUB_OUTPUT"
+
+          langs=()
+          $has_node && langs+=("javascript-typescript")
+          $has_python && langs+=("python")
+          $has_go && langs+=("go")
+          if $has_java_maven || $has_java_gradle; then langs+=("java-kotlin"); fi
+          $has_dotnet && langs+=("csharp")
+          $has_ruby && langs+=("ruby")
+          if [ ${#langs[@]} -eq 0 ]; then
+            echo 'codeql_languages_json=[]' >> "$GITHUB_OUTPUT"
+          else
+            printf -v json '[%s]' "$(printf '"%s",' "${langs[@]}" | sed 's/,$//')"
+            echo "codeql_languages_json=$json" >> "$GITHUB_OUTPUT"
+          fi
+
+  super_linter:
+    name: Super Linter
+    runs-on: ubuntu-latest
+    needs: detect
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/super-linter@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VALIDATE_ALL_CODEBASE: true
+          IGNORE_GENERATED_FILES: true
+
+  node_test:
+    name: Node.js tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_node == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install deps
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable && pnpm i --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable && yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+      - name: Lint (if present)
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null; then npm run lint; else echo "No lint script"; fi
+      - name: Test (if present)
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.test' package.json >/devnull; then npm test; else echo "No test script"; fi
+      - name: Type-check (if TS and script present)
+        run: |
+          if [ -f package.json ] && jq -e '.scripts."type-check"' package.json >/dev/null; then npm run type-check; else echo "No type-check script"; fi
+
+  python_test:
+    name: Python tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_python == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install deps
+        run: |
+          set -e
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ] && grep -q '\[project\]' pyproject.toml; then pip install -e .; fi
+          pip install pytest || true
+      - name: Syntax check
+        run: python -m compileall -q .
+      - name: Tests (pytest if present)
+        run: |
+          if [ -d tests ] || git ls-files | grep -qE '(^|/)test_.*\.py$|(^|/)tests?/.*\.py$'; then
+            pytest -q
+          else
+            echo "No tests found"
+          fi
+
+  go_test:
+    name: Go tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_go == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - run: go test ./...
+
+  java_test:
+    name: Java tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_java_maven == 'true' || needs.detect.outputs.has_java_gradle == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Maven build/test
+        if: needs.detect.outputs.has_java_maven == 'true'
+        run: mvn -B -ntp -DskipITs=false verify
+      - name: Gradle build/test
+        if: needs.detect.outputs.has_java_gradle == 'true'
+        uses: gradle/gradle-build-action@v3
+        with:
+          arguments: test
+
+  rust_test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_rust == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all --all-features
+
+  dotnet_test:
+    name: .NET tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_dotnet == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet restore
+      - run: dotnet build --configuration Release --no-restore
+      - run: dotnet test --configuration Release --no-build --verbosity normal
+
+  ruby_test:
+    name: Ruby tests
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_ruby == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+      - name: Install
+        run: |
+          if [ -f Gemfile ]; then bundle install --jobs 4 --retry 3; fi
+      - name: Tests (minitest/rspec if present)
+        run: |
+          if [ -f Rakefile ]; then bundle exec rake test || true; fi
+          if [ -f Gemfile ] && grep -q "rspec" Gemfile 2>/dev/null; then bundle exec rspec || true; fi
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.codeql_languages_json != '[]'
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJson(needs.detect.outputs.codeql_languages_json) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  vuln_scan:
+    name: Vulnerability & secrets scan (Trivy) + SBOM
+    runs-on: ubuntu-latest
+    needs: [detect]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy FS scan -> SARIF
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scanners: 'vuln,secret,misconfig'
+          format: 'sarif'
+          output: 'trivy.sarif'
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          output-file: sbom.spdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+
+  autofixes:
+    name: Generate autofix patch (formatters/linters)
+    runs-on: ubuntu-latest
+    needs: detect
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Node autofix (eslint/prettier if configured)
+        if: needs.detect.outputs.has_node == 'true'
+        shell: bash
+        run: |
+          set -e
+          if [ -f package.json ]; then
+            if jq -e '.scripts["lint:fix"]' package.json >/dev/null 2>&1; then npm run lint:fix || true; fi
+            if jq -e '.scripts["format"]' package.json >/dev/null 2>&1; then npm run format || true; fi
+            if [ -f .eslintrc ] || [ -f .eslintrc.js ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.json ]; then
+              npx --yes eslint . --fix || true
+            fi
+            if [ -f .prettierrc ] || [ -f .prettierrc.json ] || [ -f .prettierrc.js ] || [ -f .prettierrc.cjs ] || [ -f .prettierrc.yml ] || [ -f .prettierrc.yaml ] || [ -f prettier.config.js ] || [ -f prettier.config.cjs ]; then
+              npx --yes prettier . --write || true
+            fi
+          fi
+
+      - name: Python autofix (ruff/black if configured)
+        if: needs.detect.outputs.has_python == 'true'
+        shell: bash
+        run: |
+          set -e
+          pipx install ruff || pip install --user ruff || true
+          pipx install black || pip install --user black || true
+          if [ -f ruff.toml ] || [ -f pyproject.toml ] && grep -q "\[tool.ruff\]" pyproject.toml 2>/dev/null; then ruff check . --fix || true; fi
+          if [ -f pyproject.toml ] && grep -q "\[tool.black\]" pyproject.toml 2>/dev/null || [ -f black.toml ]; then black . || true; fi
+
+      - name: Go autofix (gofmt)
+        if: needs.detect.outputs.has_go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - if: needs.detect.outputs.has_go == 'true'
+        run: |
+          if git ls-files | grep -q '\.go$'; then gofmt -w . || true; fi
+
+      - name: Rust autofix (rustfmt)
+        if: needs.detect.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.detect.outputs.has_rust == 'true'
+        run: cargo fmt --all || true
+
+      - name: .NET autofix (dotnet format)
+        if: needs.detect.outputs.has_dotnet == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - if: needs.detect.outputs.has_dotnet == 'true'
+        run: dotnet format || true
+
+      - name: Ruby autofix (rubocop -A if configured)
+        if: needs.detect.outputs.has_ruby == 'true'
+        shell: bash
+        run: |
+          set -e
+          if [ -f Gemfile ] && grep -q "rubocop" Gemfile 2>/dev/null; then
+            bundle install --jobs 4 --retry 3
+            bundle exec rubocop -A || true
+          fi
+
+      - name: Prepare autofix patch
+        id: patch
+        shell: bash
+        run: |
+          set -e
+          git add -A
+          if ! git diff --cached --quiet; then
+            git diff --cached --binary > autofixes.patch
+            echo "has_patch=true" >> "$GITHUB_OUTPUT"
+            echo "changed_files=$(git diff --cached --name-only | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_patch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload autofix patch
+        if: steps.patch.outputs.has_patch == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofixes
+          path: autofixes.patch
+          if-no-files-found: ignore
+
+      - name: Comment on PR with patch instructions
+        if: steps.patch.outputs.has_patch == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+            const body = [
+              'I generated an autofix patch from formatters/linters.',
+              '',
+              'How to apply locally:',
+              '1) Download artifact "autofixes" from this workflow',
+              '2) git checkout YOUR_BRANCH',
+              '3) git apply --index autofixes.patch',
+              '4) Review and commit',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body
+            });
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs:
+      - detect
+      - super_linter
+      - node_test
+      - python_test
+      - go_test
+      - java_test
+      - rust_test
+      - dotnet_test
+      - ruby_test
+      - codeql
+      - vuln_scan
+      - autofixes
+    if: always()
+    steps:
+      - name: Write job summary
+        run: |
+          {
+            echo "## Org CI + Security Summary"
+            echo ""
+            echo "Languages:"
+            echo "- Node: ${{ needs.detect.outputs.has_node }}"
+            echo "- Python: ${{ needs.detect.outputs.has_python }}"
+            echo "- Go: ${{ needs.detect.outputs.has_go }}"
+            echo "- Java (Maven): ${{ needs.detect.outputs.has_java_maven }}"
+            echo "- Java (Gradle): ${{ needs.detect.outputs.has_java_gradle }}"
+            echo "- Rust: ${{ needs.detect.outputs.has_rust }}"
+            echo "- .NET: ${{ needs.dotnet_test.result != '' }}"
+            echo "- Ruby: ${{ needs.detect.outputs.has_ruby }}"
+            echo ""
+            echo "Jobs:"
+            echo "- Super Linter: ${{ needs.super_linter.result }}"
+            echo "- Node tests: ${{ needs.node_test.result || 'skipped' }}"
+            echo "- Python tests: ${{ needs.python_test.result || 'skipped' }}"
+            echo "- Go tests: ${{ needs.go_test.result || 'skipped' }}"
+            echo "- Java tests: ${{ needs.java_test.result || 'skipped' }}"
+            echo "- Rust tests: ${{ needs.rust_test.result || 'skipped' }}"
+            echo "- .NET tests: ${{ needs.dotnet_test.result || 'skipped' }}"
+            echo "- Ruby tests: ${{ needs.ruby_test.result || 'skipped' }}"
+            echo "- CodeQL: ${{ needs.codeql.result || 'skipped' }}"
+            echo "- Trivy/SBOM: ${{ needs.vuln_scan.result }}"
+            echo "- Autofixes: ${{ needs.autofixes.result }}"
+            echo ""
+            echo "If an 'autofixes' artifact exists, apply with: git apply --index autofixes.patch"
+            echo "See the Security tab for CodeQL and Trivy results."
+          } >> "$GITHUB_STEP_SUMMARY"
