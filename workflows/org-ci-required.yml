@@ -9,6 +9,7 @@ permissions:
   actions: read
   checks: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: required-ci-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
@@ -37,6 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           has_files() { git ls-files -z | tr '\0' '\n' | grep -E -q "$1"; }
+
           has_node=false
           has_python=false
           has_go=false
@@ -71,6 +73,7 @@ jobs:
           if $has_java_maven || $has_java_gradle; then langs+=("java-kotlin"); fi
           $has_dotnet && langs+=("csharp")
           $has_ruby && langs+=("ruby")
+
           if [ ${#langs[@]} -eq 0 ]; then
             echo 'codeql_languages_json=[]' >> "$GITHUB_OUTPUT"
           else
@@ -116,7 +119,7 @@ jobs:
           if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null; then npm run lint; else echo "No lint script"; fi
       - name: Test (if present)
         run: |
-          if [ -f package.json ] && jq -e '.scripts.test' package.json >/devnull; then npm test; else echo "No test script"; fi
+          if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null; then npm test; else echo "No test script"; fi
       - name: Type-check (if TS and script present)
         run: |
           if [ -f package.json ] && jq -e '.scripts."type-check"' package.json >/dev/null; then npm run type-check; else echo "No type-check script"; fi
@@ -285,10 +288,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Configure git user
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Node for autofix
+        if: needs.detect.outputs.has_node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Node autofix (eslint/prettier if configured)
         if: needs.detect.outputs.has_node == 'true'
@@ -306,38 +316,57 @@ jobs:
             fi
           fi
 
+      - name: Setup Python for autofix
+        if: needs.detect.outputs.has_python == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Python autofix (ruff/black if configured)
         if: needs.detect.outputs.has_python == 'true'
         shell: bash
         run: |
           set -e
-          pipx install ruff || pip install --user ruff || true
-          pipx install black || pip install --user black || true
-          if [ -f ruff.toml ] || [ -f pyproject.toml ] && grep -q "\[tool.ruff\]" pyproject.toml 2>/dev/null; then ruff check . --fix || true; fi
-          if [ -f pyproject.toml ] && grep -q "\[tool.black\]" pyproject.toml 2>/dev/null || [ -f black.toml ]; then black . || true; fi
+          python -m pip install --upgrade pip || true
+          pip install ruff black || true
+          if [ -f ruff.toml ] || { [ -f pyproject.toml ] && grep -q "\[tool.ruff\]" pyproject.toml 2>/dev/null; }; then ruff check . --fix || true; fi
+          if { [ -f pyproject.toml ] && grep -q "\[tool.black\]" pyproject.toml 2>/dev/null; } || [ -f black.toml ]; then black . || true; fi
 
-      - name: Go autofix (gofmt)
+      - name: Setup Go for autofix
         if: needs.detect.outputs.has_go == 'true'
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - if: needs.detect.outputs.has_go == 'true'
+
+      - name: Go autofix (gofmt)
+        if: needs.detect.outputs.has_go == 'true'
         run: |
           if git ls-files | grep -q '\.go$'; then gofmt -w . || true; fi
 
-      - name: Rust autofix (rustfmt)
+      - name: Setup Rust for autofix
         if: needs.detect.outputs.has_rust == 'true'
         uses: dtolnay/rust-toolchain@stable
-      - if: needs.detect.outputs.has_rust == 'true'
+
+      - name: Rust autofix (rustfmt)
+        if: needs.detect.outputs.has_rust == 'true'
         run: cargo fmt --all || true
 
-      - name: .NET autofix (dotnet format)
+      - name: Setup .NET for autofix
         if: needs.detect.outputs.has_dotnet == 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - if: needs.detect.outputs.has_dotnet == 'true'
+
+      - name: .NET autofix (dotnet format)
+        if: needs.detect.outputs.has_dotnet == 'true'
         run: dotnet format || true
+
+      - name: Setup Ruby for autofix
+        if: needs.detect.outputs.has_ruby == 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
 
       - name: Ruby autofix (rubocop -A if configured)
         if: needs.detect.outputs.has_ruby == 'true'
@@ -374,10 +403,13 @@ jobs:
       - name: Comment on PR with patch instructions
         if: steps.patch.outputs.has_patch == 'true' && github.event_name == 'pull_request'
         uses: actions/github-script@v7
+        env:
+          CHANGED_FILES: ${{ steps.patch.outputs.changed_files }}
         with:
           script: |
             const pr = context.payload.pull_request;
             if (!pr) return;
+            const changedFiles = process.env.CHANGED_FILES || 'n/a';
             const body = [
               'I generated an autofix patch from formatters/linters.',
               '',
@@ -386,6 +418,8 @@ jobs:
               '2) git checkout YOUR_BRANCH',
               '3) git apply --index autofixes.patch',
               '4) Review and commit',
+              '',
+              `Changed files: ${changedFiles}`,
             ].join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -417,14 +451,14 @@ jobs:
           {
             echo "## Org CI + Security Summary"
             echo ""
-            echo "Languages:"
+            echo "Languages detected:"
             echo "- Node: ${{ needs.detect.outputs.has_node }}"
             echo "- Python: ${{ needs.detect.outputs.has_python }}"
             echo "- Go: ${{ needs.detect.outputs.has_go }}"
             echo "- Java (Maven): ${{ needs.detect.outputs.has_java_maven }}"
             echo "- Java (Gradle): ${{ needs.detect.outputs.has_java_gradle }}"
             echo "- Rust: ${{ needs.detect.outputs.has_rust }}"
-            echo "- .NET: ${{ needs.dotnet_test.result != '' }}"
+            echo "- .NET: ${{ needs.detect.outputs.has_dotnet }}"
             echo "- Ruby: ${{ needs.detect.outputs.has_ruby }}"
             echo ""
             echo "Jobs:"
